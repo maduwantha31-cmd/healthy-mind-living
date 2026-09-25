@@ -336,6 +336,9 @@ const st={store:null,role:"client",isOwner:false,config:{...DEFAULT_CONFIG},me:n
 let SB=null;
 function cfgReady(){ const c=window.HML_CONFIG||{}; return !!(c.supabaseUrl&&c.supabaseAnonKey&&window.supabase); }
 async function boot(){
+  const hash=location.hash||"";
+  if(/type=invite/.test(hash)){ st.authMode="recover"; st.authInvite=true; }
+  else if(/error_description=/.test(hash)){ st.authMsg=decodeURIComponent((hash.match(/error_description=([^&]*)/)||[])[1]||"").replace(/\+/g," ")||"That link is invalid or has expired."; if(/expired|invalid/i.test(st.authMsg)) st.authMsg="That link has expired. Ask your clinic to send a new invite, or use “Forgot password?”."; }
   if(!cfgReady()){ st.store=DemoStore(); st.role=lsGet("hml-role","client"); return start(); }
   const c=window.HML_CONFIG;
   SB=window.supabase.createClient(c.supabaseUrl,c.supabaseAnonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
@@ -370,8 +373,8 @@ function showAuth(){
   $("#roleSlot").innerHTML=""; $("#bannerSlot").innerHTML=""; $("#tabbar").hidden=true;
   const m=st.authMode||"signin", msg=st.authMsg||"", ok=st.authOk||"";
   const f=st.authForm||{};
-  const title={signin:"Welcome back",signup:"Create your account",forgot:"Reset your password",recover:"Choose a new password"}[m];
-  const sub={signin:"Sign in to your calm space.",signup:"Use the email address your clinic invited, then choose a password.",forgot:"We'll email you a link to set a new password.",recover:"Enter a new password for your account."}[m];
+  const title={signin:"Welcome back",signup:"Create your account",forgot:"Reset your password",recover:st.authInvite?"Welcome! Choose a password":"Choose a new password"}[m];
+  const sub={signin:"Sign in to your calm space.",signup:"Use the email address your clinic invited, then choose a password.",forgot:"We'll email you a link to set a new password.",recover:st.authInvite?"Set a password to finish creating your account.":"Enter a new password for your account."}[m];
   $("#app").innerHTML=`<div class="card" style="max-width:440px;margin:32px auto"><h1 style="margin-bottom:6px">${title}</h1><p class="hand" style="margin-bottom:14px">${sub}</p>
   <form id="authForm" class="stack" novalidate>
    ${m!=="recover"?`<label><b>Email</b><input type="email" id="auEmail" autocomplete="email" value="${esc(f.email||"")}"></label>`:""}
@@ -407,7 +410,7 @@ document.addEventListener("submit",async ev=>{
     } else if(m==="recover"){
       const {error}=await SB.auth.updateUser({password:pw});
       if(error) return fail(error.message);
-      st.authMode="signin"; st.authOk=""; history.replaceState(null,"",location.pathname);
+      st.authMode="signin"; st.authOk=""; st.authInvite=false; history.replaceState(null,"",location.pathname);
       const {data:{session}}=await SB.auth.getSession(); if(session) enter(session); else showAuth();
     }
   }catch(e){ fail("Something went wrong. Check your connection and try again."); }
@@ -653,7 +656,7 @@ function doctorView(){
   const nav=`<div class="row between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px"><div class="seg" role="group" aria-label="Dashboard section"><button data-drmain="patients" aria-pressed="${st.drMain!=="schedule"}">Patients</button><button data-drmain="schedule" aria-pressed="${st.drMain==="schedule"}">Schedule${pendingCount?" ("+pendingCount+")":""}</button></div><button class="btn ghost sm" id="addClientBtn">+ Add client</button></div>`;
   if(st.drMain==="schedule") return nav+scheduleView();
   const list=`<div class="card plist"><div class="row between" style="padding:6px 6px 10px"><h3>Clients</h3><button class="btn ghost sm" data-dr="settings">Clinic settings</button></div>
-    ${ps.length?ps.map(p=>`<button class="pitem" data-pat="${esc(p.id)}" aria-current="${st.sel===p.id}"><span class="avatar">${esc(initials(p.name))}</span><span style="flex:1;min-width:0"><b style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name||"Unnamed")}${p.id===st.store.me?" (you, test)":""}</b><span class="small muted">${p.invited&&!p.lastCheckIn?"Invited · "+esc(p.email||""):"Anxiety "+(p.lastAnxiety??"—")+" · "+ago(p.lastCheckIn)}</span></span>${spark(p.recent)}${p.flagged?'<span class="dot" title="Needs attention"></span>':(p.lastActivity>(seen[p.id]||0)?'<span class="dot" style="background:var(--blue)" title="New activity"></span>':"")}</button>`).join(""):`<p class="empty small">No clients yet. Use “+ Add client” to invite someone by email.</p>`}</div>`;
+    ${ps.length?ps.map(p=>`<button class="pitem" data-pat="${esc(p.id)}" aria-current="${st.sel===p.id}"><span class="avatar">${esc(initials(p.name))}</span><span style="flex:1;min-width:0"><b style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name||p.email||"Unnamed")}${p.id===st.store.me?" (you, test)":""}</b><span class="small muted">${p.invited&&!p.lastCheckIn?"Invited · "+esc(p.email||""):"Anxiety "+(p.lastAnxiety??"—")+" · "+ago(p.lastCheckIn)}</span></span>${spark(p.recent)}${p.flagged?'<span class="dot" title="Needs attention"></span>':(p.lastActivity>(seen[p.id]||0)?'<span class="dot" style="background:var(--blue)" title="New activity"></span>':"")}</button>`).join(""):`<p class="empty small">No clients yet. Use “+ Add client” to invite someone by email.</p>`}</div>`;
   let main;
   if(st.drTab==="settings") main=settingsView();
   else if(!st.sel){
@@ -677,7 +680,7 @@ function scheduleView(){
 function openAddAppt(){
   const ps=[...st.patients].sort((a,b)=>(a.name||"").localeCompare(b.name||""));
   $("#dlgBody").innerHTML=`<h2 style="margin-bottom:10px">Schedule an appointment</h2><div class="stack" style="margin-top:10px">
-  <label><b>Client</b><select id="apPat" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--card)">${ps.map(p=>`<option value="${esc(p.id)}">${esc(p.name||"Unnamed")}</option>`).join("")}</select></label>
+  <label><b>Client</b><select id="apPat" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--card)">${ps.map(p=>`<option value="${esc(p.id)}">${esc(p.name||p.email||"Unnamed")}</option>`).join("")}</select></label>
   <label><b>Date</b><input type="date" id="apDate" min="${new Date().toISOString().slice(0,10)}"></label>
   <label><b>Time</b><input type="text" id="apTime" placeholder="e.g. 4:00 pm"></label>
   <label><b>Note (optional)</b><textarea id="apReason" rows="2"></textarea></label>
@@ -810,6 +813,12 @@ document.addEventListener("click",async ev=>{
     const id="inv-"+email.toLowerCase();
     b.disabled=true;
     try{
+      if(st.store.mode==="live"){
+        const {data,error}=await SB.functions.invoke("invite-client",{body:{email:email.toLowerCase(),name,redirectTo:location.origin+location.pathname}});
+        let msg=data?.error; if(!msg&&error){ try{ msg=(await error.context.json()).error; }catch(_){ msg=error.message; } }
+        if(msg){ toast(/already/i.test(msg)?"That email already has an account.":"Couldn't send invite: "+msg); b.disabled=false; return; }
+        toast("Invite emailed to "+email); $("#dlg").close(); return;
+      }
       await st.store.upsertPatient(id,{name:name||email,email:email.toLowerCase(),joinedAt:now(),invited:true});
       const link=location.href.split("#")[0];
       const subject="You're invited to "+st.config.clinicName;
