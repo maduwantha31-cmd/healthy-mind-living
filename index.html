@@ -198,6 +198,8 @@ dialog::backdrop{background:rgba(14,24,41,.45)}
 <dialog id="dlg"><div class="dlg" id="dlgBody"></div></dialog>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="config.js"></script>
+<script src="vendor/supabase.js"></script>
 <script>
 "use strict";
 /* ---------------- helpers ---------------- */
@@ -293,47 +295,123 @@ function seedDemo(){
   return {config:{},patients:{"demo-a":mk("Nadia Perera (sample)",7,1.5),"demo-b":mk("Ravi Fernando (sample)",6,-3),"demo-me":{summary:{},entries:[],messages:[]}}};
 }
 
-function LiveStore(db,me){
-  let chain=Promise.resolve();
-  const q=fn=>(chain=chain.then(fn,fn));
-  const snapList=(query,cb,map)=>query.onSnapshot(s=>cb(s.docs.map(d=>({id:d.id,...d.data()})).map(map||(x=>x))),e=>{console.warn(e);cb([]);});
+function LiveStore(sb,me){
+  const err=e=>{ if(e) throw e; };
+  const subs=(tables,filterCol,filterVal,load,cb)=>{
+    let dead=false, busy=false, again=false;
+    const run=async()=>{ if(dead) return; if(busy){ again=true; return; } busy=true; try{ cb(await load()); }catch(e){ console.warn(e); } busy=false; if(again){ again=false; run(); } };
+    const ch=sb.channel("rt-"+Math.random().toString(36).slice(2));
+    tables.forEach(t=>ch.on("postgres_changes",{event:"*",schema:"public",table:t,...(filterCol?{filter:filterCol+"=eq."+filterVal}:{})},run));
+    ch.subscribe();
+    const poll=setInterval(run,30000);
+    run();
+    return ()=>{ dead=true; clearInterval(poll); sb.removeChannel(ch); };
+  };
   return {
     mode:"live", me,
-    subscribeConfig:cb=>db.doc("config/clinic").onSnapshot(s=>cb({...DEFAULT_CONFIG,...(s.exists?s.data():{})}),e=>cb({...DEFAULT_CONFIG})),
-    setConfig:c=>q(async()=>{const r=db.doc("config/clinic");const s=await r.get();await r.set({...(s.exists?s.data():{}),...c});}),
-    subscribePatients:cb=>snapList(db.collection("patients"),cb),
-    getPatient:async uid=>{const s=await db.doc("patients/"+uid).get();return s.exists?s.data():null;},
-    upsertPatient:(uid,d)=>q(async()=>{const r=db.doc("patients/"+uid);const s=await r.get();if(s.exists)await r.update(d);else await r.set({joinedAt:now(),...d});}),
-    subscribeEntries:(uid,cb)=>snapList(db.collection("patients/"+uid+"/entries").orderBy("createdAt","desc").limit(300),cb),
-    addEntry:(uid,e)=>db.collection("patients/"+uid+"/entries").add(e),
-    subscribeMessages:(uid,cb)=>snapList(db.collection("patients/"+uid+"/messages").orderBy("createdAt","asc").limit(300),cb),
-    addMessage:(uid,m)=>db.collection("patients/"+uid+"/messages").add(m),
-    updateMessage:(uid,mid,patch)=>db.doc("patients/"+uid+"/messages/"+mid).update(patch)
+    subscribeConfig:cb=>subs(["config"],null,null,async()=>{ const {data,error}=await sb.from("config").select("data").eq("id",1).maybeSingle(); err(error); return {...DEFAULT_CONFIG,...(data?.data||{})}; },cb),
+    setConfig:async c=>{ const {data,error}=await sb.from("config").select("data").eq("id",1).maybeSingle(); err(error); const r=await sb.from("config").upsert({id:1,data:{...(data?.data||{}),...c}}); err(r.error); },
+    subscribePatients:cb=>subs(["patients","invites"],null,null,async()=>{
+      const [p,i]=await Promise.all([sb.from("patients").select("id,data"),sb.from("invites").select("email,name,created_at")]);
+      err(p.error); err(i.error);
+      return [...p.data.map(r=>({id:r.id,...r.data})),...i.data.map(r=>({id:"inv-"+r.email,name:r.name||r.email,email:r.email,invited:true,joinedAt:new Date(r.created_at).getTime()}))];
+    },cb),
+    getPatient:async uid=>{ if(String(uid).startsWith("inv-")) return null; const {data,error}=await sb.from("patients").select("data").eq("id",uid).maybeSingle(); err(error); return data?data.data:null; },
+    upsertPatient:async(uid,d)=>{
+      if(String(uid).startsWith("inv-")){ const email=String(uid).slice(4); const r=await sb.from("invites").upsert({email,name:d.name&&d.name!==email?d.name:null}); err(r.error); return; }
+      const r=await sb.rpc("upsert_patient",{pid:uid,patch:d}); err(r.error);
+    },
+    subscribeEntries:(uid,cb)=>subs(["entries"],"patient_id",uid,async()=>{ const {data,error}=await sb.from("entries").select("id,type,created_at,data").eq("patient_id",uid).order("created_at",{ascending:false}).limit(300); err(error); return data.map(r=>({id:r.id,type:r.type,createdAt:Number(r.created_at),data:r.data})); },cb),
+    addEntry:async(uid,e)=>{ const r=await sb.from("entries").insert({patient_id:uid,type:e.type,created_at:e.createdAt,data:e.data}); err(r.error); },
+    subscribeMessages:(uid,cb)=>subs(["messages"],"patient_id",uid,async()=>{ const {data,error}=await sb.from("messages").select("id,created_at,data").eq("patient_id",uid).order("created_at",{ascending:true}).limit(300); err(error); return data.map(r=>({id:r.id,createdAt:Number(r.created_at),...r.data})); },cb),
+    addMessage:async(uid,m)=>{ const {createdAt,...rest}=m; const r=await sb.from("messages").insert({patient_id:uid,created_at:createdAt,data:rest}); err(r.error); },
+    updateMessage:async(uid,mid,patch)=>{ const r=await sb.rpc("update_message",{mid,patch}); err(r.error); },
+    deletePatient:async pid=>{ const r=await sb.rpc("delete_patient",{pid}); err(r.error); }
   };
 }
 
 /* ---------------- app state ---------------- */
 const st={store:null,role:"client",isOwner:false,config:{...DEFAULT_CONFIG},me:null,profile:null,entries:[],messages:[],patients:[],view:"home",sel:null,selEntries:[],selMessages:[],drTab:"overview",drMain:"patients",form:{},unsub:[],selUnsub:[]};
 
+let SB=null;
+function cfgReady(){ const c=window.HML_CONFIG||{}; return !!(c.supabaseUrl&&c.supabaseAnonKey&&window.supabase); }
 async function boot(){
-  let db=null,user=null;
-  const published=!!(window.claude && typeof window.claude.use==="function");
-  try{ if(published){ [db,user]=await Promise.all([window.claude.use("db"),window.claude.use("user")]); } }catch(e){}
-  let uid=null;
-  if(db&&user){ uid=await user.id(); st.isOwner=await user.isOwner(); }
-  if(db&&uid){ st.store=LiveStore(db,uid); st.role=st.isOwner?"doctor":"client"; st.meName=(await user.me()).name||""; }
-  else if(published){ return noAccess(); }
-  else { st.store=DemoStore(); st.role=lsGet("hml-role","client"); }
+  if(!cfgReady()){ st.store=DemoStore(); st.role=lsGet("hml-role","client"); return start(); }
+  const c=window.HML_CONFIG;
+  SB=window.supabase.createClient(c.supabaseUrl,c.supabaseAnonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+  SB.auth.onAuthStateChange((ev,session)=>{
+    if(ev==="PASSWORD_RECOVERY"){ st.authMode="recover"; return showAuth(); }
+    if(ev==="SIGNED_OUT"){ teardown(); showAuth(); }
+    else if(ev==="SIGNED_IN"&&session&&st.store?.mode!=="live"&&st.authMode!=="recover") setTimeout(()=>enter(session),0);
+  });
+  const {data:{session}}=await SB.auth.getSession();
+  if(st.authMode==="recover") return;
+  if(session) enter(session); else showAuth();
+}
+async function enter(session){
+  if(st.entering) return; st.entering=true;
+  try{
+    const {data:prof,error}=await SB.from("profiles").select("role,email").eq("id",session.user.id).maybeSingle();
+    if(error||!prof){ await SB.auth.signOut(); st.entering=false; st.authMsg="We couldn't find your account. Please ask your clinic to invite you."; return showAuth(); }
+    st.isOwner=prof.role==="doctor"; st.role=st.isOwner?"doctor":"client"; st.userEmail=prof.email;
+    st.store=LiveStore(SB,session.user.id);
+    await start();
+  }catch(e){ console.error(e); st.authMsg="Couldn't load your account. Check your connection and try again."; st.store=null; showAuth(); }
+  st.entering=false;
+}
+async function start(){
   st.store.subscribeConfig(c=>{st.config=c;render();});
   attachClient();
   if(st.role==="doctor") attachDoctor();
   render();
 }
-function noAccess(){
-  $("#roleSlot").innerHTML=""; $("#tabbar").hidden=true;
-  $("#app").innerHTML=`<div class="card" style="max-width:520px;margin:40px auto;text-align:center"><h1 style="margin-bottom:10px">Welcome</h1><p class="hand" style="margin-bottom:12px">You're heard, valued and supported.</p><p>This space hasn't been opened for you yet. Please ask your doctor to share it with you, then open the link again while signed in.</p><p class="small muted">If you need help right now, tap "Need help now?" at the top.</p></div>`;
-  st.store={mode:"none"};
+function teardown(){ st.unsub.forEach(f=>f&&f()); st.unsub=[]; st.selUnsub.forEach(f=>f&&f()); st.selUnsub=[]; drAttached=false; Object.assign(st,{store:null,profile:null,entries:[],messages:[],patients:[],sel:null,selEntries:[],selMessages:[],view:"home",form:{},isOwner:false,role:"client",authMode:"signin"}); $("#roleSlot").innerHTML=""; $("#bannerSlot").innerHTML=""; $("#tabbar").hidden=true; }
+function showAuth(){
+  $("#roleSlot").innerHTML=""; $("#bannerSlot").innerHTML=""; $("#tabbar").hidden=true;
+  const m=st.authMode||"signin", msg=st.authMsg||"", ok=st.authOk||"";
+  const f=st.authForm||{};
+  const title={signin:"Welcome back",signup:"Create your account",forgot:"Reset your password",recover:"Choose a new password"}[m];
+  const sub={signin:"Sign in to your calm space.",signup:"Use the email address your clinic invited, then choose a password.",forgot:"We'll email you a link to set a new password.",recover:"Enter a new password for your account."}[m];
+  $("#app").innerHTML=`<div class="card" style="max-width:440px;margin:32px auto"><h1 style="margin-bottom:6px">${title}</h1><p class="hand" style="margin-bottom:14px">${sub}</p>
+  <form id="authForm" class="stack" novalidate>
+   ${m!=="recover"?`<label><b>Email</b><input type="email" id="auEmail" autocomplete="email" value="${esc(f.email||"")}"></label>`:""}
+   ${m!=="forgot"?`<label><b>${m==="recover"?"New password":"Password"}</b><input type="password" id="auPw" autocomplete="${m==="signin"?"current-password":"new-password"}" placeholder="${m==="signin"?"":"At least 8 characters"}"></label>`:""}
+   ${m==="signup"?`<label><b>Confirm password</b><input type="password" id="auPw2" autocomplete="new-password"></label>`:""}
+   ${msg?`<p class="tag rose" role="alert" style="white-space:normal">${esc(msg)}</p>`:""}${ok?`<p class="tag sage" role="status" style="white-space:normal">${esc(ok)}</p>`:""}
+   <button class="btn" type="submit" id="auGo">${{signin:"Sign in",signup:"Create account",forgot:"Send reset link",recover:"Save new password"}[m]}</button>
+  </form>
+  <p class="small" style="margin-top:14px;display:flex;gap:14px;flex-wrap:wrap">${m==="signin"?`<a href="#" data-auth="signup">First time? Create account</a><a href="#" data-auth="forgot">Forgot password?</a>`:m==="recover"?"":`<a href="#" data-auth="signin">Back to sign in</a>`}</p>
+  <p class="small muted" style="margin-top:10px">If you need help right now, tap “Need help now?” at the top.</p></div>`;
 }
+document.addEventListener("click",ev=>{ const a=ev.target.closest("[data-auth]"); if(!a) return; ev.preventDefault(); st.authMode=a.dataset.auth; st.authMsg=""; st.authOk=""; st.authForm={email:($("#auEmail")||{}).value||""}; showAuth(); });
+document.addEventListener("submit",async ev=>{
+  if(ev.target.id!=="authForm") return; ev.preventDefault();
+  const m=st.authMode||"signin", email=(($("#auEmail")||{}).value||"").trim().toLowerCase(), pw=($("#auPw")||{}).value||"", pw2=($("#auPw2")||{}).value||"";
+  const fail=t=>{ st.authMsg=t; st.authOk=""; st.authForm={email}; showAuth(); };
+  if(m!=="recover"&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail("Enter a valid email address.");
+  if(m!=="forgot"&&pw.length<8) return fail("Password must be at least 8 characters.");
+  if(m==="signup"&&pw!==pw2) return fail("Passwords don't match.");
+  const btn=$("#auGo"); btn.disabled=true; st.authMsg=""; st.authOk="";
+  try{
+    if(m==="signin"){
+      const {error}=await SB.auth.signInWithPassword({email,password:pw});
+      if(error) return fail(/confirm/i.test(error.message)?"Please confirm your email first. Check your inbox for the link.":"Email or password is incorrect.");
+    } else if(m==="signup"){
+      const {data,error}=await SB.auth.signUp({email,password:pw,options:{emailRedirectTo:location.origin+location.pathname}});
+      if(error) return fail(/database error|NOT_INVITED|not invited/i.test(error.message)?"This email hasn't been invited yet. Please ask your clinic to invite you.":/registered|exists/i.test(error.message)?"An account with this email already exists. Try signing in.":error.message);
+      if(!data.session){ st.authMode="signin"; st.authForm={email}; st.authOk="Account created. Check your email and click the confirmation link, then sign in."; return showAuth(); }
+    } else if(m==="forgot"){
+      const {error}=await SB.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname});
+      if(error) return fail("Couldn't send the email. Try again in a few minutes.");
+      st.authMode="signin"; st.authForm={email}; st.authOk="If that email has an account, a reset link is on its way."; return showAuth();
+    } else if(m==="recover"){
+      const {error}=await SB.auth.updateUser({password:pw});
+      if(error) return fail(error.message);
+      st.authMode="signin"; st.authOk=""; history.replaceState(null,"",location.pathname);
+      const {data:{session}}=await SB.auth.getSession(); if(session) enter(session); else showAuth();
+    }
+  }catch(e){ fail("Something went wrong. Check your connection and try again."); }
+});
 function attachClient(){
   const s=st.store, me=s.me;
   st.unsub.push(s.subscribeEntries(me,e=>{st.entries=e;render();}));
@@ -357,6 +435,7 @@ function renderChrome(){
   } else if(st.isOwner){
     h=`<div class="seg" role="group" aria-label="View as"><button data-role="doctor" aria-pressed="${st.role==="doctor"}">Dashboard</button><button data-role="client" aria-pressed="${st.role==="client"}">Client preview</button></div>`;
   }
+  if(s.mode==="live") h+=`<button class="btn ghost sm" id="signOut" title="${esc(st.userEmail||"")}">Sign out</button>`;
   rs.innerHTML=h;
   let b="";
   if(s.mode==="demo") b=`<div class="shell" style="padding-bottom:0;padding-top:12px"><div class="banner">Demo mode: everything is saved on this device only, and the two sample clients are made up. Switch between Client and Doctor above to see both sides.</div></div>`;
@@ -574,7 +653,7 @@ function doctorView(){
   const nav=`<div class="row between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px"><div class="seg" role="group" aria-label="Dashboard section"><button data-drmain="patients" aria-pressed="${st.drMain!=="schedule"}">Patients</button><button data-drmain="schedule" aria-pressed="${st.drMain==="schedule"}">Schedule${pendingCount?" ("+pendingCount+")":""}</button></div><button class="btn ghost sm" id="addClientBtn">+ Add client</button></div>`;
   if(st.drMain==="schedule") return nav+scheduleView();
   const list=`<div class="card plist"><div class="row between" style="padding:6px 6px 10px"><h3>Clients</h3><button class="btn ghost sm" data-dr="settings">Clinic settings</button></div>
-    ${ps.length?ps.map(p=>`<button class="pitem" data-pat="${esc(p.id)}" aria-current="${st.sel===p.id}"><span class="avatar">${esc(initials(p.name))}</span><span style="flex:1;min-width:0"><b style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name||"Unnamed")}${p.id===st.store.me?" (you, test)":""}</b><span class="small muted">${p.invited&&!p.lastCheckIn?"Invited · "+esc(p.email||""):"Anxiety "+(p.lastAnxiety??"—")+" · "+ago(p.lastCheckIn)}</span></span>${spark(p.recent)}${p.flagged?'<span class="dot" title="Needs attention"></span>':(p.lastActivity>(seen[p.id]||0)?'<span class="dot" style="background:var(--blue)" title="New activity"></span>':"")}</button>`).join(""):`<p class="empty small">No clients yet. Share this app's link with a client; they appear here after their first visit.</p>`}</div>`;
+    ${ps.length?ps.map(p=>`<button class="pitem" data-pat="${esc(p.id)}" aria-current="${st.sel===p.id}"><span class="avatar">${esc(initials(p.name))}</span><span style="flex:1;min-width:0"><b style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name||"Unnamed")}${p.id===st.store.me?" (you, test)":""}</b><span class="small muted">${p.invited&&!p.lastCheckIn?"Invited · "+esc(p.email||""):"Anxiety "+(p.lastAnxiety??"—")+" · "+ago(p.lastCheckIn)}</span></span>${spark(p.recent)}${p.flagged?'<span class="dot" title="Needs attention"></span>':(p.lastActivity>(seen[p.id]||0)?'<span class="dot" style="background:var(--blue)" title="New activity"></span>':"")}</button>`).join(""):`<p class="empty small">No clients yet. Use “+ Add client” to invite someone by email.</p>`}</div>`;
   let main;
   if(st.drTab==="settings") main=settingsView();
   else if(!st.sel){
@@ -607,7 +686,7 @@ function openAddAppt(){
   $("#dlg").showModal();
 }
 function openAddClient(){
-  $("#dlgBody").innerHTML=`<h2 style="margin-bottom:10px">Add a client</h2><p class="muted" style="margin-bottom:12px">${st.store.mode==="demo"?"Demo mode — this creates a local test client and drafts an invite email (nothing is actually sent).":"Enter the client's email to invite them. They'll show as “Invited” until they open the link and sign in for the first time."}</p>
+  $("#dlgBody").innerHTML=`<h2 style="margin-bottom:10px">Add a client</h2><p class="muted" style="margin-bottom:12px">${st.store.mode==="demo"?"Demo mode — this creates a local test client and drafts an invite email (nothing is actually sent).":"Enter the client's email to invite them. They'll show as “Invited” until they create their account with that email address."}</p>
   <div class="stack">
   <label><b>Client's email</b><input type="email" id="newClientEmail" placeholder="name@example.com" autocomplete="off"></label>
   <label><b>Name (optional)</b><input type="text" id="newClientName" placeholder="Client's name"></label>
@@ -710,6 +789,7 @@ document.addEventListener("click",async ev=>{
   const b=ev.target.closest("button,[data-go]"); if(!b) return;
   const d=b.dataset, f=st.form;
   if(b.id==="helpBtn"||b.id==="helpTile") return openHelp();
+  if(b.id==="signOut"){ await SB.auth.signOut(); return; }
   if(b.id==="brandBtn"){ if(st.role==="client") go("home"); else {st.drTab="overview";st.drMain="patients";selectPatient(null);} return; }
   if(d.role){ st.role=d.role; lsSet("hml-role",d.role); if(d.role==="doctor") attachDoctor(); st.view="home"; render(); return; }
   if(d.go!==undefined){ return go(d.go,d.task); }
@@ -727,13 +807,13 @@ document.addEventListener("click",async ev=>{
   if(b.id==="addClientGo"){
     const email=$("#newClientEmail").value.trim(), name=$("#newClientName").value.trim();
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return toast("Enter a valid email address.");
-    const id="inv-"+Math.random().toString(36).slice(2,9);
+    const id="inv-"+email.toLowerCase();
     b.disabled=true;
     try{
-      await st.store.upsertPatient(id,{name:name||email,email,joinedAt:now(),invited:true});
+      await st.store.upsertPatient(id,{name:name||email,email:email.toLowerCase(),joinedAt:now(),invited:true});
       const link=location.href.split("#")[0];
       const subject="You're invited to "+st.config.clinicName;
-      const body="Hi"+(name?" "+name:"")+",\n\n"+st.config.doctorName+" has invited you to "+st.config.clinicName+".\n\nOpen this link and enter your name to get started:\n"+link+"\n\n"+st.config.welcome;
+      const body="Hi"+(name?" "+name:"")+",\n\n"+st.config.doctorName+" has invited you to "+st.config.clinicName+".\n\nOpen this link, choose \"First time? Create account\", and use this email address ("+email+"):\n"+link+"\n\n"+st.config.welcome;
       window.open("mailto:"+encodeURIComponent(email)+"?subject="+encodeURIComponent(subject)+"&body="+encodeURIComponent(body),"_blank");
       toast("Client added"); $("#dlg").close();
     }catch(e){ toast("Couldn't add client."); b.disabled=false; }
