@@ -272,6 +272,7 @@ function DemoStore(){
     subscribeMessages:(uid,cb)=>sub(()=>cb([...(S.patients[uid]?.messages||[])].sort((a,b)=>a.createdAt-b.createdAt))),
     addMessage:async(uid,m)=>{P(uid).messages.push({id:id(),...m});emit();},
     updateMessage:async(uid,mid,patch)=>{const m=P(uid).messages.find(x=>x.id===mid);if(m)Object.assign(m,patch);emit();},
+    deletePatient:async pid=>{delete S.patients[pid];emit();},
     reset:()=>{S=seedDemo();emit();}
   };
 }
@@ -741,7 +742,7 @@ function patientDetail(){
       <div class="row" style="margin-top:8px"><label for="drTask" class="small muted">Assign</label><select id="drTask" style="border:1px solid var(--line);border-radius:10px;padding:8px;background:var(--card)"><option value="">Nothing</option>${Object.entries(TASKS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select><button class="btn" id="drSend">Send</button></div></div></div>`;
   }
   return `<div class="card"><div class="row between"><div class="row"><span class="avatar" style="width:48px;height:48px;font-size:1.1rem">${esc(initials(p.name))}</span><div><h2>${esc(p.name||"Client")}</h2><p class="small muted" style="margin:0">${p.email?esc(p.email)+" · ":""}Joined ${p.joinedAt?fmtDate(p.joinedAt):"—"} · last check-in ${ago(p.lastCheckIn)} · next appt: ${p.nextAppt?apptLine(p.nextAppt):"none"}</p></div></div>
-    <div class="row">${p.flagged?`<span class="tag rose">${esc(p.flagReason||"Needs attention")}</span><button class="btn sm ghost" id="clearFlag">Mark reviewed</button>`:""}<button class="btn sm ghost" id="genReport">Report</button><button class="btn sm ghost" data-pat="">Close</button></div></div>
+    <div class="row">${p.flagged?`<span class="tag rose">${esc(p.flagReason||"Needs attention")}</span><button class="btn sm ghost" id="clearFlag">Mark reviewed</button>`:""}<button class="btn sm ghost" id="genReport">Report</button><button class="btn sm ghost" id="delClient" style="color:var(--rose)">Delete</button><button class="btn sm ghost" data-pat="">Close</button></div></div>
     <div class="seg" role="tablist" style="margin-top:14px">${tabs.map(([k,l])=>`<button role="tab" data-drtab="${k}" aria-pressed="${st.drTab===k}" aria-selected="${st.drTab===k}">${l}</button>`).join("")}</div></div>
     ${body}`;
 }
@@ -833,6 +834,8 @@ document.addEventListener("click",async ev=>{
   if(b.id==="addApptBtn"){ openAddAppt(); return; }
   if(b.id==="addApptGo"){ const pid=$("#apPat").value, date=$("#apDate").value, time=$("#apTime").value.trim(), reason=$("#apReason").value.trim(); if(!pid||!date) return toast("Choose a client and date."); b.disabled=true; try{ await st.store.upsertPatient(pid,{nextAppt:{date,time,reason,status:"confirmed"}}); await st.store.addEntry(pid,{type:"appointment",createdAt:now(),data:{date,time,reason,status:"confirmed",by:"doctor"}}); toast("Appointment scheduled"); $("#dlg").close(); render(); }catch(e){ toast("Couldn't schedule."); b.disabled=false; } return; }
   if(b.id==="genReport"){ openReport(); return; }
+  if(b.id==="delClient"){ const p=st.patients.find(x=>x.id===st.sel)||{}; if(st.sel===st.store.me) return toast("You can't delete your own test record here."); $("#dlgBody").innerHTML=`<h2 style="margin-bottom:10px">Delete ${esc(p.name||"this client")}?</h2><p>This permanently deletes their account, check-ins, worksheets and messages. It can't be undone.</p><div class="row" style="margin-top:14px"><button class="btn" id="delClientGo" style="background:var(--rose)">Yes, delete permanently</button><button class="btn ghost" id="closeDlg">Cancel</button></div>`; $("#dlg").showModal(); return; }
+  if(b.id==="delClientGo"){ const pid=st.sel; b.disabled=true; try{ await st.store.deletePatient(pid); st.patients=st.patients.filter(x=>x.id!==pid); selectPatient(null); $("#dlg").close(); toast("Client deleted"); }catch(e){ console.error(e); toast("Couldn't delete. Try again."); b.disabled=false; } return; }
   if(b.id==="printReport"){ window.print(); return; }
 
   if(b.id==="saveName"){ const n=$("#nm").value.trim(); if(!n) return toast("Please enter a name."); b.disabled=true; try{ await st.store.upsertPatient(st.store.me,{name:n,lastActivity:now()}); st.profile={...(st.profile||{}),name:n}; render(); }catch(e){ toast("Couldn't save. Try again."); b.disabled=false; } return; }
