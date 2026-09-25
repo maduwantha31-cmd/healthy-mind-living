@@ -6,7 +6,7 @@ A single-file, mobile-first web app for a solo psychology practice: a private "c
 
 This is a **demo/prototype**, not a production clinical system. In demo mode all data is stored only in the visitor's own browser (`localStorage`) — nothing is shared between devices or visible to anyone else. There is no real login and no real database yet.
 
-See `Patient_Care_Architecture_and_Build_Prompt.md` (if present in this repo) for the full architecture, security, and launch-readiness plan this prototype is based on — including what's required before any real patient data can be used (Supabase backend, real authentication, backups, privacy review, etc).
+A separate architecture doc (not in this repo) covers the full architecture, security, and launch-readiness plan this prototype is based on — including what's required before any real patient data can be used (Supabase backend, real authentication, backups, privacy review, etc).
 
 ## Running locally
 
