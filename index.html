@@ -348,11 +348,13 @@ async function boot(){
     else if(ev==="SIGNED_IN"&&session&&st.store?.mode!=="live"&&st.authMode!=="recover") setTimeout(()=>enter(session),0);
   });
   const {data:{session}}=await SB.auth.getSession();
-  if(st.authMode==="recover") return;
+  if(st.authMode==="recover"){ if(session) showAuth(); else { st.authMode="signin"; st.authInvite=false; st.authMsg="That invite link has expired. Ask your clinic to send a new one."; showAuth(); } return; }
   if(session) enter(session); else showAuth();
 }
 async function enter(session){
-  if(st.entering) return; st.entering=true;
+  if(st.entering) return;
+  if(session.user.invited_at&&!session.user.user_metadata?.pw_set){ st.authMode="recover"; st.authInvite=true; return showAuth(); }
+  st.entering=true;
   try{
     const {data:prof,error}=await SB.from("profiles").select("role,email").eq("id",session.user.id).maybeSingle();
     if(error||!prof){ await SB.auth.signOut(); st.entering=false; st.authMsg="We couldn't find your account. Please ask your clinic to invite you."; return showAuth(); }
@@ -408,7 +410,7 @@ document.addEventListener("submit",async ev=>{
       if(error) return fail("Couldn't send the email. Try again in a few minutes.");
       st.authMode="signin"; st.authForm={email}; st.authOk="If that email has an account, a reset link is on its way."; return showAuth();
     } else if(m==="recover"){
-      const {error}=await SB.auth.updateUser({password:pw});
+      const {error}=await SB.auth.updateUser({password:pw,data:{pw_set:true}});
       if(error) return fail(error.message);
       st.authMode="signin"; st.authOk=""; st.authInvite=false; history.replaceState(null,"",location.pathname);
       const {data:{session}}=await SB.auth.getSession(); if(session) enter(session); else showAuth();
